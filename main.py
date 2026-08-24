@@ -49,12 +49,6 @@ from PySide6.QtWidgets import (
 from PySide6.QtGui import QFont, QPixmap, QIcon, QDesktopServices
 from PySide6.QtCore import Qt, QTimer, QThread, Signal, QDateTime, QUrl
 
-# ==========================================
-# THREAD JUMP DETECTION (MODUL BARU)
-# ==========================================
-# ==========================================
-# THREAD JUMP DETECTION (MODUL BARU)
-# ==========================================
 class JumpDetectionThread(QThread):
     activity_update = Signal(str)
     report_update = Signal(str)
@@ -352,58 +346,67 @@ class CheckDataThread(QThread):
     report_update = Signal(str)      
     error_update = Signal(str)
     finished_update = Signal(str)
+    graph_data_update = Signal(object, object) # Mengirim data grafik (Std, UUT)
 
     def __init__(self, dir_std, dir_uut):
         super().__init__()
         self.dir_std = dir_std
         self.dir_uut = dir_uut
+        self.df_std_grouped = pd.DataFrame()
+        self.df_uut_grouped = pd.DataFrame()
 
-    def get_mjd_sttime(self, filepath):
-        mjds = {} 
+    def parse_cggtts_full(self, filepath):
+        data = []
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 lines = f.readlines()
             
             header_idx = -1
+            header_cols = []
             for i, line in enumerate(lines):
                 if 'MJD' in line and 'STTIME' in line:
                     header_idx = i
                     header_cols = line.strip().split()
                     break
             
-            if header_idx != -1:
-                idx_mjd = header_cols.index('MJD')
-                idx_time = header_cols.index('STTIME')
-                
-                for line in lines[header_idx+2:]:
-                    parts = line.strip().split()
-                    if len(parts) > max(idx_mjd, idx_time):
-                        if parts[idx_mjd].isdigit() and parts[idx_time].isdigit():
-                            mjd = int(parts[idx_mjd])
-                            sttime = int(parts[idx_time])
-                            if mjd not in mjds:
-                                mjds[mjd] = set()
-                            mjds[mjd].add(sttime)
-        except:
-            pass
-        return mjds
+            if header_idx == -1: return pd.DataFrame()
 
-    def analyze_folder(self, folder_path, title, start_prog, end_prog):
+            ref_col_name = 'REFSYS' if 'REFSYS' in header_cols else 'REFGPS'
+            sat_col_name = 'SAT' if 'SAT' in header_cols else 'PRN'
+            
+            idx_sat = header_cols.index(sat_col_name)
+            idx_mjd = header_cols.index('MJD')
+            idx_time = header_cols.index('STTIME')
+            idx_ref = header_cols.index(ref_col_name)
+
+            for line in lines[header_idx+2:]:
+                parts = line.strip().split()
+                if len(parts) > max(idx_sat, idx_mjd, idx_time, idx_ref):
+                    sat = parts[idx_sat]
+                    if not sat[0].isdigit(): sat = sat[1:] 
+                    
+                    data.append({
+                        'SAT/PRN': int(sat),
+                        'MJD': int(parts[idx_mjd]),
+                        'STTIME': int(parts[idx_time]),
+                        'REF': float(parts[idx_ref]) / 10.0,
+                    })
+        except: pass
+        return pd.DataFrame(data)
+
+    def analyze_folder_with_jump(self, folder_path, title, start_prog, end_prog):
         files = [f for f in Path(folder_path).glob('*') if f.is_file()]
         if not files:
-            return f"=== DATA {title.upper()} ===\nFolder kosong atau tidak ditemukan.\n\n"
+            return f"=== DATA {title.upper()} ===\nFolder kosong atau tidak ditemukan.\n\n", pd.DataFrame()
         
-        all_data = {}
+        raw_dfs = []
         total_files = len(files)
         
         for i, f in enumerate(files):
             self.activity_update.emit(f"Membaca {title}: {f.name}")
-            mjd_dict = self.get_mjd_sttime(f)
-            
-            for m, st_set in mjd_dict.items():
-                if m not in all_data:
-                    all_data[m] = set()
-                all_data[m].update(st_set)
+            df_file = self.parse_cggtts_full(f)
+            if not df_file.empty:
+                raw_dfs.append(df_file)
             
             prog = start_prog + int(((i + 1) / total_files) * (end_prog - start_prog))
             self.progress_update.emit(prog)
@@ -411,46 +414,68 @@ class CheckDataThread(QThread):
         report = f"=== DATA {title.upper()} ===\n"
         report += f"Total File Terbaca : {total_files}\n"
         
-        if not all_data:
+        if not raw_dfs:
             report += "Tidak ditemukan data CGGTTS yang valid.\n\n"
-            return report
+            return report, pd.DataFrame()
             
+        df_all = pd.concat(raw_dfs, ignore_index=True)
+        df_grouped = df_all.groupby(['MJD', 'STTIME'], as_index=False)['REF'].mean()
+        df_grouped = df_grouped.sort_values(['MJD', 'STTIME']).reset_index(drop=True)
+
         epoch = datetime(1858, 11, 17)
-        months_present = set()
-        for m in all_data.keys():
-            dt = epoch + timedelta(days=m)
-            months_present.add(dt.strftime('%B %Y'))
+        unique_mjds = df_grouped['MJD'].unique()
+        months_present = { (epoch + timedelta(days=int(m))).strftime('%B %Y') for m in unique_mjds }
             
         report += f"Bulan/Tahun Data   : {', '.join(sorted(list(months_present)))}\n"
-        report += f"Total Hari (MJD)   : {len(all_data)} hari\n\n"
-        
-        report += "Rincian Kelengkapan STTIME per Hari:\n"
-        report += "-"*40 + "\n"
-        report += f"{'MJD':<10} | {'Tanggal':<12} | {'Jumlah STTIME'}\n"
-        report += "-"*40 + "\n"
-        
-        for m in sorted(all_data.keys()):
-            st_count = len(all_data[m])
-            dt = epoch + timedelta(days=m)
-            dt_str = dt.strftime('%Y-%m-%d')
-            report += f"{m:<10} | {dt_str:<12} | {st_count} waktu\n"
-        
-        report += "\n\n"
-        return report
+        report += f"Total Hari (MJD)   : {len(unique_mjds)} hari\n"
+        report += f"Total Titik Waktu  : {len(df_grouped)} titik\n"
+
+        # Hitung Allan Variance
+        y_vals = df_grouped['REF'].values
+        if len(y_vals) > 2:
+            allan_var = np.mean((y_vals[2:] - 2*y_vals[1:-1] + y_vals[:-2])**2) / 2
+        else:
+            allan_var = 0.0
+        report += f"Allan Variance     : {allan_var:.6e} ns²\n\n"
+
+        # Deteksi Jump >= 100 ns
+        jumps = []
+        for i in range(1, len(df_grouped)):
+            diff = y_vals[i] - y_vals[i-1]
+            if abs(diff) >= 100.0:
+                jumps.append({
+                    'MJD': df_grouped.loc[i, 'MJD'],
+                    'STTIME': df_grouped.loc[i, 'STTIME'],
+                    'Delta (ns)': diff
+                })
+
+        if jumps:
+            report += f"STATUS JUMP: Ditemukan {len(jumps)} loncatan (>= 100 ns):\n"
+            report += "-"*45 + "\n"
+            report += f"{'No':<4} | {'MJD':<8} | {'STTIME':<8} | {'Besar Loncatan'}\n"
+            report += "-"*45 + "\n"
+            for idx, j in enumerate(jumps, 1):
+                report += f"{idx:<4} | {j['MJD']:<8} | {j['STTIME']:<8} | {j['Delta (ns)']:.3f} ns\n"
+        else:
+            report += "STATUS JUMP: Tidak ada loncatan (jump) >= 100 ns terdeteksi.\n"
+
+        report += "\n" + "="*45 + "\n\n"
+        return report, df_grouped
 
     def run(self):
         try:
             self.progress_update.emit(0)
             
-            report_std = self.analyze_folder(self.dir_std, "Standard", 0, 50)
-            report_uut = self.analyze_folder(self.dir_uut, "UUT", 50, 100)
+            report_std, self.df_std_grouped = self.analyze_folder_with_jump(self.dir_std, "Standard", 0, 50)
+            report_uut, self.df_uut_grouped = self.analyze_folder_with_jump(self.dir_uut, "UUT", 50, 100)
             
-            final_report = "LAPORAN CEK KELENGKAPAN DATA CGGTTS\n"
-            final_report += "="*40 + "\n\n"
+            final_report = "LAPORAN CEK KELENGKAPAN & JUMP DETECTION DATA CGGTTS\n"
+            final_report += "="*50 + "\n\n"
             final_report += report_std
             final_report += report_uut
             
             self.activity_update.emit("Pengecekan Selesai.")
+            self.graph_data_update.emit(self.df_std_grouped, self.df_uut_grouped)
             self.report_update.emit(final_report)
             self.finished_update.emit("Selesai")
             
@@ -962,11 +987,6 @@ class CGGTTSMainApp(QWidget):
         self.setup_remote_tab()
         self.tabs.addTab(self.tab_remote, "Remote Clock Calibration")
 
-        # TAB JUMP DETECTION
-        self.tab_jump = QWidget()
-        self.setup_jump_detection_tab()
-        self.tabs.addTab(self.tab_jump, "Jump Detection")
-
         self.tab_kalkulator_mjd = QWidget()
         self.setup_kalkulator_mjd_tab()
         self.tabs.addTab(self.tab_kalkulator_mjd, "Kalkulator MJD")
@@ -990,135 +1010,6 @@ class CGGTTSMainApp(QWidget):
         lbl_footer.setAlignment(Qt.AlignLeft)
         lbl_footer.setStyleSheet("font-size: 8pt; color: black; margin-top: 5px;")
         main_layout.addWidget(lbl_footer)
-
-    # ==========================================
-    # FUNGSI SETUP TAB JUMP DETECTION
-    # ==========================================
-    def setup_jump_detection_tab(self):
-        tab_layout = QVBoxLayout(self.tab_jump)
-        tab_layout.setContentsMargins(15, 20, 15, 15)
-
-        input_box = QHBoxLayout()
-        v_btns = QVBoxLayout()
-        v_edits = QVBoxLayout()
-        
-        v_btns.addWidget(QPushButton("Directory Data", clicked=lambda: self.get_path(self.txt_jump_dir)))
-        self.txt_jump_dir = QLineEdit(readOnly=True)
-        self.txt_jump_dir.setPlaceholderText("Pilih folder data CGGTTS untuk jump detection...")
-        v_edits.addWidget(self.txt_jump_dir)
-
-        input_box.addLayout(v_btns, 1)
-        input_box.addLayout(v_edits, 4)
-        tab_layout.addLayout(input_box)
-
-        bottom_layout = QHBoxLayout()
-        bottom_layout.setSpacing(20)
-
-        left_side = QVBoxLayout()
-        self.btn_jump_start = QPushButton("JALANKAN JUMP DETECTION", clicked=self.run_jump_detection)
-        self.btn_jump_start.setFixedHeight(45)
-        self.btn_jump_start.setStyleSheet("background-color: #ff9800; border: 1px solid #ef6c00;")
-        
-        self.btn_jump_graph = QPushButton("TAMPILKAN GRAFIK ALLAN", clicked=self.show_jump_graph)
-        self.btn_jump_graph.setFixedHeight(35)
-        self.btn_jump_graph.setStyleSheet("background-color: #1976d2; border: 1px solid #1565c0;")
-        self.btn_jump_graph.setEnabled(False) 
-
-        self.btn_jump_excel = QPushButton("SIMPAN KE EXCEL", clicked=self.save_jump_excel)
-        self.btn_jump_excel.setFixedHeight(35)
-        self.btn_jump_excel.setStyleSheet("background-color: #2e7d32; border: 1px solid #1b5e20;")
-        self.btn_jump_excel.setEnabled(False)
-
-        self.lbl_activity_jump = QLabel("Menunggu input...")
-        self.lbl_activity_jump.setStyleSheet("color: #d84315; font-style: italic; font-weight: bold;")
-        
-        left_side.addWidget(self.btn_jump_start)
-        left_side.addWidget(self.btn_jump_graph)
-        left_side.addWidget(self.btn_jump_excel)
-        left_side.addSpacing(10)
-        left_side.addWidget(self.lbl_activity_jump)
-        left_side.addStretch()
-
-        right_side = QVBoxLayout()
-        right_side.addWidget(QLabel("<b>HASIL ANALISIS JUMP DETECTION:</b>"))
-        self.log_jump = QTextEdit(readOnly=True) 
-        self.log_jump.setStyleSheet("font-family: Consolas; font-size: 10pt;")
-        self.log_jump.setPlaceholderText("Laporan hasil deteksi loncatan akan ditampilkan di sini...")
-        right_side.addWidget(self.log_jump)
-
-        bottom_layout.addLayout(left_side, 1)  
-        bottom_layout.addLayout(right_side, 2) 
-        
-        tab_layout.addLayout(bottom_layout)
-
-    def run_jump_detection(self):
-        folder_path = self.txt_jump_dir.text().strip()
-        if not folder_path:
-            self.lbl_activity_jump.setText("Error: Pilih folder data terlebih dahulu!")
-            return
-            
-        self.btn_jump_start.setEnabled(False)
-        self.btn_jump_graph.setEnabled(False)
-        self.btn_jump_excel.setEnabled(False)
-        self.log_jump.clear()
-
-        self.jump_worker = JumpDetectionThread(folder_path)
-        self.jump_worker.activity_update.connect(lambda m: self.lbl_activity_jump.setText(f"Aktifitas: {m}"))
-        self.jump_worker.report_update.connect(self.log_jump.setPlainText)
-        self.jump_worker.graph_data_update.connect(self.receive_jump_graph_data)
-        self.jump_worker.finished_update.connect(self.on_jump_finish)
-        self.jump_worker.error_update.connect(self.on_jump_err)
-        self.jump_worker.start()
-
-    def receive_jump_graph_data(self, df):
-        self.df_jump_graph = df
-
-    def on_jump_finish(self, msg):
-        self.btn_jump_start.setEnabled(True)
-        self.btn_jump_graph.setEnabled(True)
-        self.btn_jump_excel.setEnabled(True)
-        self.lbl_activity_jump.setText("Selesai")
-
-    def on_jump_err(self, msg):
-        self.btn_jump_start.setEnabled(True)
-        self.lbl_activity_jump.setText("Error terjadi")
-        self.log_jump.setPlainText(f"[ERROR]\n{msg}")
-
-    def show_jump_graph(self):
-        if not hasattr(self, 'df_jump_graph') or self.df_jump_graph.empty:
-            return
-        df = self.df_jump_graph.copy()
-        x_time = df['MJD'] + df['STTIME'] / 86400.0
-        y_ref = df['REF'].astype(float).values
-
-        plt.figure("Grafik Rata-rata Waktu & Jump Detection", figsize=(10, 5))
-        plt.plot(x_time, y_ref, 'g.-', label='Rata-rata REFSYS/REFGPS', markersize=3)
-        plt.title("Grafik Data Rata-rata per Waktu (Jump Detection)")
-        plt.xlabel("MJD (Fraksi)")
-        plt.ylabel("Nilai (ns)")
-        plt.legend(loc="best")
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.tight_layout()
-        plt.show()
-
-    def save_jump_excel(self):
-        if not hasattr(self, 'jump_worker') or self.jump_worker.df_result.empty:
-            return
-        
-        path, _ = QFileDialog.getSaveFileName(self, "Simpan File Excel Jump Detection", "", "Excel Files (*.xlsx)")
-        if path:
-            try:
-                with pd.ExcelWriter(path, engine='openpyxl') as writer:
-                    self.jump_worker.df_result.to_excel(writer, sheet_name="Rata_Rata_Waktu", index=False)
-                    if self.jump_worker.jumps_result:
-                        df_jumps = pd.DataFrame(self.jump_worker.jumps_result)
-                        df_jumps.to_excel(writer, sheet_name="Daftar_Jump", index=False)
-                    else:
-                        df_jumps = pd.DataFrame({'Keterangan': ['Tidak ada jump >= 100 ns']})
-                        df_jumps.to_excel(writer, sheet_name="Daftar_Jump", index=False)
-                QMessageBox.information(self, "Sukses", f"Hasil Jump Detection berhasil disimpan ke:\n{path}")
-            except Exception as e:
-                QMessageBox.critical(self, "Error", f"Gagal menyimpan file Excel: {e}")
 
     # ==========================================
     # FUNGSI SETUP TAB KHUSUS MONTE CARLO
@@ -1504,6 +1395,10 @@ class CGGTTSMainApp(QWidget):
         self.btn_check = QPushButton("CEK KELENGKAPAN", clicked=self.run_check_data)
         self.btn_check.setFixedHeight(45)
         self.btn_check.setStyleSheet("background-color: #ff9800; border: 1px solid #ef6c00;")
+        self.btn_check_graph = QPushButton("TAMPILKAN GRAFIK", clicked=self.show_check_graph)
+        self.btn_check_graph.setFixedHeight(35)
+        self.btn_check_graph.setStyleSheet("background-color: #1976d2; border: 1px solid #1565c0;")
+        self.btn_check_graph.setEnabled(False)
         
         self.pbar_check = QProgressBar()
         self.pbar_check.setFixedHeight(25)
@@ -1512,6 +1407,7 @@ class CGGTTSMainApp(QWidget):
         self.lbl_activity_check.setStyleSheet("color: #d84315; font-style: italic; font-weight: bold;")
         
         left_side.addWidget(self.btn_check)
+        left_side.addWidget(self.btn_check_graph)
         left_side.addSpacing(10)
         left_side.addWidget(QLabel("Progress:"))
         left_side.addWidget(self.pbar_check)
@@ -1714,6 +1610,7 @@ class CGGTTSMainApp(QWidget):
         self.checker.activity_update.connect(lambda m: self.lbl_activity_check.setText(f"Aktifitas: {m}"))
         self.checker.progress_update.connect(self.pbar_check.setValue)
         self.checker.report_update.connect(self.log_check.setPlainText)
+        self.checker.graph_data_update.connect(self.receive_check_graph_data) # <-- Tambahkan ini
         self.checker.finished_update.connect(self.on_check_finish)
         self.checker.error_update.connect(self.on_check_err)
         self.checker.start()
@@ -1796,6 +1693,41 @@ class CGGTTSMainApp(QWidget):
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.tight_layout()
         plt.show() 
+    def receive_check_graph_data(self, df_std, df_uut):
+        self.df_check_std = df_std
+        self.df_check_uut = df_uut
+        self.btn_check_graph.setEnabled(True)
+
+    def show_check_graph(self):
+        plt.figure("Grafik Cek Kelengkapan & Jump Detection (Standard vs UUT)", figsize=(10, 6))
+
+        plt.subplot(2, 1, 1)
+        if hasattr(self, 'df_check_std') and not self.df_check_std.empty:
+            x_std = self.df_check_std['MJD'] + self.df_check_std['STTIME'] / 86400.0
+            y_std = self.df_check_std['REF'].astype(float).values
+            plt.plot(x_std, y_std, 'g.-', label='Standard (REFSYS/REFGPS)', markersize=3)
+        plt.title("Data Rata-rata Standard")
+        plt.ylabel("Waktu (ns)")
+        plt.legend(loc="best")
+        plt.grid(True, linestyle='--', alpha=0.7)
+
+        plt.subplot(2, 1, 2)
+        if hasattr(self, 'df_check_uut') and not self.df_check_uut.empty:
+            x_uut = self.df_check_uut['MJD'] + self.df_check_uut['STTIME'] / 86400.0
+            y_uut = self.df_check_uut['REF'].astype(float).values
+            plt.plot(x_uut, y_uut, 'b.-', label='UUT (REFSYS/REFGPS)', markersize=3)
+        plt.title("Data Rata-rata UUT")
+        plt.xlabel("MJD (Fraksi)")
+        plt.ylabel("Waktu (ns)")
+        plt.legend(loc="best")
+        plt.grid(True, linestyle='--', alpha=0.7)
+
+        plt.tight_layout()
+        plt.show()
+
+    def on_check_finish(self, msg):
+        self.btn_check.setEnabled(True)
+        self.lbl_activity_check.setText("Selesai")
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

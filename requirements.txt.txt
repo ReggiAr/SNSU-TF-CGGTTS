@@ -1,0 +1,9 @@
+PySide6
+matplotlib
+pandas
+numpy
+astropy
+scipy
+requests
+openpyxl
+pyinstaller
