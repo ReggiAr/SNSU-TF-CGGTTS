@@ -486,6 +486,9 @@ class CheckDataThread(QThread):
 # ==========================================
 # THREAD PEMROSESAN DATA 
 # ==========================================
+# ==========================================
+# THREAD PEMROSESAN DATA 
+# ==========================================
 class AnalysisThread(QThread):
     activity_update = Signal(str)      
     progress_update = Signal(int)      
@@ -612,7 +615,8 @@ class AnalysisThread(QThread):
         m1 = int(min_m)
         while not (str(m1).endswith('4') or str(m1).endswith('9')): m1 -= 1
         
-        m2 = int(max_m)
+        # Kita lebarkan batas atas hingga mjd + 1 agar data hari esok (untuk interpolasi intra-day) ikut tertarik jika memungkinkan
+        m2 = int(max_m) + 1
         while not (str(m2).endswith('4') or str(m2).endswith('9')): m2 += 1
         
         url = f"https://webtai.bipm.org/api/v0.2-beta/get-data.html?scale=utc&lab=IDN&outfile=txt&mjd1={m1}&mjd2={m2}"
@@ -626,8 +630,14 @@ class AnalysisThread(QThread):
                 if len(parts) >= 2 and parts[0].isdigit():
                     bipm_data[int(parts[0])] = float(parts[1])
             
-            corrections = {}
+            # Rentang MJD yang perlu dikalkulasi nilainya harian (termasuk MJD max + 1 untuk referensi hari esok)
+            target_mjds = set(unique_mjds)
             for m in unique_mjds:
+                target_mjds.add(m + 1)
+            target_mjds = sorted(list(target_mjds))
+
+            corrections = {}
+            for m in target_mjds:
                 if m in bipm_data:
                     corrections[m] = {'val': bipm_data[m], 'src': 'BIPM'}
                 else:
@@ -640,13 +650,12 @@ class AnalysisThread(QThread):
                         corrections[m] = {'val': round(interp_val, 3), 'src': 'Prediksi (Regresi)'}
                     elif lower_m is not None and upper_m is None:
                         past_keys = sorted([k for k in bipm_data.keys() if k < m], reverse=True)
-                        if len(past_keys) >=2:
+                        if len(past_keys) >= 2:
                             l1 = past_keys[0]
                             l2 = past_keys[1]
-
-                            slope = (bipm_data[l1] - bipm_data[l2]/(l1-l2))
-                            extrap_val = bipm_data[l1] + slope * (m-l1)
-                            corrections[m] = {'val':round(extrap_val, 3), 'src': 'Prediksi (Ekstrapolasi)'}
+                            slope = (bipm_data[l1] - bipm_data[l2]) / (l1 - l2)
+                            extrap_val = bipm_data[l1] + slope * (m - l1)
+                            corrections[m] = {'val': round(extrap_val, 3), 'src': 'Prediksi (Ekstrapolasi)'}
                         else:
                             corrections[m] = {'val': bipm_data[lower_m], 'src': 'Prediksi (Hold Terakhir)'}
                     else:
@@ -656,21 +665,46 @@ class AnalysisThread(QThread):
             self.error_update.emit(f"Gagal mengambil API BIPM: {e}")
             return {m: {'val': 0.0, 'src': 'Error API'} for m in unique_mjds}
 
+    def get_time_interpolated_correction(self, mjd, sttime, bipm_corrections):
+        # Mengambil nilai koreksi harian hari ini
+        curr_info = bipm_corrections.get(mjd, {'val': 0.0, 'src': 'Tidak Ada'})
+        val_today = curr_info['val']
+        src = curr_info['src']
+        
+        # Mengambil nilai koreksi harian hari esok (mjd + 1)
+        next_info = bipm_corrections.get(mjd + 1, None)
+        if next_info is not None:
+            val_tomorrow = next_info['val']
+        else:
+            val_tomorrow = val_today # Hold jika hari esok tidak tersedia
+            
+        # Konversi format STTIME (HHMMSS, contoh: 213015) menjadi total detik dalam sehari
+        sttime_int = int(sttime)
+        hours = sttime_int // 10000
+        minutes = (sttime_int % 10000) // 100
+        seconds = sttime_int % 100
+        total_seconds = hours * 3600 + minutes * 60 + seconds
+        
+        # Interpolasi linier intra-day berdasarkan total detik dibagi 86400
+        daily_diff = val_tomorrow - val_today
+        fraction = float(total_seconds) / 86400.0
+        interpolated_val = val_today + daily_diff * fraction
+        
+        return round(interpolated_val, 3), src
+
     def stage_4_correction(self, df_matched_raw, ref_std, ref_uut, col_std, col_uut):
         unique_mjds = df_matched_raw['MJD'].dropna().unique().tolist()
         if not unique_mjds:
             return pd.DataFrame(), {}
             
         bipm_corrections = self.get_bipm_corrections(unique_mjds)
-        self.activity_update.emit("Tahap 6: Menerapkan Koreksi BIPM ke Standar...")
+        self.activity_update.emit("Tahap 6: Menerapkan Koreksi BIPM Per Waktu ke Standar...")
         
         formatted_rows = []
         groups = df_matched_raw.groupby(['MJD', 'STTIME'])
         
         for (mjd, sttime), frame in groups:
-            corr_info = bipm_corrections.get(mjd, {'val': 0.0, 'src': 'Tidak Ada'})
-            koreksi = corr_info['val']
-            sumber = corr_info['src']
+            koreksi, sumber = self.get_time_interpolated_correction(mjd, sttime, bipm_corrections)
             
             for _, row in frame.iterrows():
                 refsys_std_val = row[col_std]
@@ -683,7 +717,7 @@ class AnalysisThread(QThread):
                     f'{ref_std}_STD': refsys_std_val,
                     'Nilai Koreksi': koreksi,
                     'Sumber Data': sumber,
-                    f'{ref_std}_Terkoreksi': refsys_std_val + (koreksi),
+                    f'{ref_std}_Terkoreksi': refsys_std_val + koreksi,
                     ' ': None,  
                     'SAT/PRN_UUT': row['SAT/PRN'],
                     'MJD_UUT': mjd,
@@ -704,15 +738,13 @@ class AnalysisThread(QThread):
         count = 0
 
         for (mjd, sttime), frame in groups:
-            corr_info = bipm_corrections.get(mjd, {'val': 0.0, 'src': 'Tidak Ada'})
-            koreksi = corr_info['val']
-            sumber = corr_info['src']
+            koreksi, sumber = self.get_time_interpolated_correction(mjd, sttime, bipm_corrections)
             
             for _, row in frame.iterrows():
                 refsys_std_val = row[col_std]
                 refsys_uut_val = row[col_uut]
                 
-                refsys_terkoreksi = refsys_std_val + (koreksi)
+                refsys_terkoreksi = refsys_std_val + koreksi
                 selisih = refsys_terkoreksi - refsys_uut_val
                 
                 total_diff += selisih
@@ -748,14 +780,14 @@ class AnalysisThread(QThread):
         groups_mjd = df_matched_raw.groupby('MJD')
         
         for mjd, frame_mjd in groups_mjd:
-            koreksi = bipm_corrections.get(mjd, {'val': 0.0})['val']
             groups_sttime = frame_mjd.groupby('STTIME')
             
             for sttime, frame in groups_sttime:
+                koreksi, _ = self.get_time_interpolated_correction(mjd, sttime, bipm_corrections)
                 mean_std_raw = frame[col_std].mean()
                 mean_uut = frame[col_uut].mean()
                 
-                mean_std_terkoreksi = mean_std_raw + (koreksi)
+                mean_std_terkoreksi = mean_std_raw + koreksi
                 mean_selisih = mean_std_terkoreksi - mean_uut
                 
                 time_rows.append({
@@ -804,10 +836,12 @@ class AnalysisThread(QThread):
         daily_rows = []
         groups_harian = df_matched_raw.groupby('MJD')
         for mjd, frame in groups_harian:
-            koreksi = bipm_corrections.get(mjd, {'val': 0.0})['val']
+            mean_sttime = frame['STTIME'].mean() if 'STTIME' in frame.columns else 0
+            koreksi, _ = self.get_time_interpolated_correction(mjd, mean_sttime, bipm_corrections)
+            
             mean_std_raw = frame[col_std].mean()
             mean_uut = frame[col_uut].mean()
-            mean_std_terkoreksi = mean_std_raw + (koreksi)
+            mean_std_terkoreksi = mean_std_raw + koreksi
             mean_selisih = mean_std_terkoreksi - mean_uut
             
             daily_rows.append({
