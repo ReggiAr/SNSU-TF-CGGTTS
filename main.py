@@ -683,7 +683,7 @@ class AnalysisThread(QThread):
                     f'{ref_std}_STD': refsys_std_val,
                     'Nilai Koreksi': koreksi,
                     'Sumber Data': sumber,
-                    f'{ref_std}_Terkoreksi': refsys_std_val - abs(koreksi),
+                    f'{ref_std}_Terkoreksi': refsys_std_val + (koreksi),
                     ' ': None,  
                     'SAT/PRN_UUT': row['SAT/PRN'],
                     'MJD_UUT': mjd,
@@ -712,7 +712,7 @@ class AnalysisThread(QThread):
                 refsys_std_val = row[col_std]
                 refsys_uut_val = row[col_uut]
                 
-                refsys_terkoreksi = refsys_std_val - abs(koreksi)
+                refsys_terkoreksi = refsys_std_val + (koreksi)
                 selisih = refsys_terkoreksi - refsys_uut_val
                 
                 total_diff += selisih
@@ -755,7 +755,7 @@ class AnalysisThread(QThread):
                 mean_std_raw = frame[col_std].mean()
                 mean_uut = frame[col_uut].mean()
                 
-                mean_std_terkoreksi = mean_std_raw - abs(koreksi)
+                mean_std_terkoreksi = mean_std_raw + (koreksi)
                 mean_selisih = mean_std_terkoreksi - mean_uut
                 
                 time_rows.append({
@@ -807,7 +807,7 @@ class AnalysisThread(QThread):
             koreksi = bipm_corrections.get(mjd, {'val': 0.0})['val']
             mean_std_raw = frame[col_std].mean()
             mean_uut = frame[col_uut].mean()
-            mean_std_terkoreksi = mean_std_raw - abs(koreksi)
+            mean_std_terkoreksi = mean_std_raw + (koreksi)
             mean_selisih = mean_std_terkoreksi - mean_uut
             
             daily_rows.append({
